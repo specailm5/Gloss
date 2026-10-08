@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="Gloss">
+  <title>Gloss</title>
+  <g fill="#16181D">
+    <path d="M74 164 H182 A22 22 0 0 1 204 186 A22 22 0 0 1 182 208 H74 A22 22 0 0 1 52 186 A22 22 0 0 1 74 164 Z"/>
+    <path d="M128 48 Q143 81 176 96 Q143 111 128 144 Q113 111 80 96 Q113 81 128 48 Z"/>
+  </g>
+</svg>
