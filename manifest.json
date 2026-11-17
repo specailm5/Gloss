@@ -1,23 +1,26 @@
 {
   "manifest_version": 3,
   "name": "Gloss",
-  "version": "0.1.0",
-  "description": "Right-click any word to instantly see what it means — everyday words, acronyms, and technical jargon.",
+  "version": "0.3.0",
+  "description": "Right-click any word to instantly see what it means — everyday words, people and places, acronyms and technical jargon.",
   "permissions": ["contextMenus", "activeTab", "scripting", "storage"],
   "host_permissions": [
     "https://api.datamuse.com/*",
     "https://api.dictionaryapi.dev/*",
     "https://en.wiktionary.org/*",
     "https://upload.wikimedia.org/*",
-    "https://en.wikipedia.org/*"
+    "https://en.wikipedia.org/*",
+    "https://www.wikidata.org/*",
+    "https://openlibrary.org/*",
+    "https://api.crossref.org/*",
+    "https://pubchem.ncbi.nlm.nih.gov/*",
+    "https://api.gbif.org/*",
+    "https://api.artic.edu/*",
+    "https://api.stackexchange.com/*"
   ],
   "background": {
     "scripts": ["background.js"],
     "service_worker": "background.js"
-  },
-  "options_ui": {
-    "page": "options.html",
-    "open_in_tab": false
   },
   "icons": {
     "16": "icons/icon-16.png",

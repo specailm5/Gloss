@@ -4,23 +4,26 @@
 const api = globalThis.browser ?? globalThis.chrome;
 
 const MENU_ID = "gloss-define";
-const AI_MENU_ID = "gloss-define-ai";
-const SETTINGS_KEY = "gloss:settings";
-const AI_STATE_KEY = "gloss:ai";
-const AI_HINT_KEY = "gloss:aiHint";
+const LEGACY_AI_KEYS = ["gloss:settings", "gloss:ai", "gloss:aiHint"];
 const REQUEST_TIMEOUT_MS = 3000;
 const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 const MISS_CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours — outages shouldn't stick
 
 // Bump CACHE_VERSION to invalidate previously cached results after a fix.
-const CACHE_VERSION = "v2";
+const CACHE_VERSION = "v4";
 const BASE_CACHE_PREFIX = `gloss:${CACHE_VERSION}:base:`;
 const SEARCH_CACHE_PREFIX = `gloss:${CACHE_VERSION}:search:`;
 const PRON_CACHE_PREFIX = `gloss:${CACHE_VERSION}:pron:`;
 const WIKT_AUDIO_CACHE_PREFIX = `gloss:${CACHE_VERSION}:wiktaudio:`;
+const ENTITY_CACHE_PREFIX = `gloss:${CACHE_VERSION}:entity:`;
+const TOPIC_CACHE_PREFIX = `gloss:${CACHE_VERSION}:topic:`;
+
+const TOPIC_TIMEOUT_MS = 2500;
 
 // Minimum context-overlap score before we override the default meaning.
 const CONTEXT_MIN_SCORE = 3;
+// Minimum overlap before we reorder dictionary senses by the page's sentence.
+const DEFINITION_MIN_SCORE = 2;
 
 // ---------------------------------------------------------------------------
 // Context menu
@@ -37,99 +40,27 @@ api.runtime.onInstalled.addListener(async () => {
     title: 'What is "%s"?',
     contexts: ["selection"],
   });
-  await refreshAiMenu(await getAiAvailability());
-});
 
-// Keep the AI menu item in sync with the model's availability across restarts.
-api.runtime.onStartup.addListener(async () => {
-  await refreshAiMenu(await getAiAvailability());
-});
-
-// The AI menu item only exists while the on-device model is actually ready, so
-// users who never download it never see a dead option.
-async function refreshAiMenu(availability) {
+  // Drop state left behind by the removed on-device AI feature.
   try {
-    await api.contextMenus.remove(AI_MENU_ID);
-  } catch {
-    // didn't exist
-  }
-  if (availability !== "available") return;
-  try {
-    api.contextMenus.create({
-      id: AI_MENU_ID,
-      title: 'Explain "%s" with on-device AI',
-      contexts: ["selection"],
-    });
-  } catch {
-    // already exists
-  }
-}
-
-async function getAiAvailability() {
-  try {
-    const stored = await api.storage.local.get(AI_STATE_KEY);
-    return stored?.[AI_STATE_KEY]?.availability ?? "unknown";
-  } catch {
-    return "unknown";
-  }
-}
-
-async function setAiAvailability(availability) {
-  try {
-    await api.storage.local.set({
-      [AI_STATE_KEY]: { availability, checkedAt: Date.now() },
-    });
+    await api.storage.local.remove(LEGACY_AI_KEYS);
   } catch {
     // best effort
   }
-}
-
-// The one-time hint is shown at most once, ever.
-async function shouldShowAiHint() {
-  if (await aiEnabled()) return false;
-
-  const availability = await getAiAvailability();
-  if (availability !== "downloadable" && availability !== "available") return false;
-
-  try {
-    const stored = await api.storage.local.get(AI_HINT_KEY);
-    return !stored?.[AI_HINT_KEY];
-  } catch {
-    return false;
-  }
-}
-
-async function markHintShown() {
-  try {
-    await api.storage.local.set({ [AI_HINT_KEY]: true });
-  } catch {
-    // best effort
-  }
-}
+});
 
 api.contextMenus.onClicked.addListener(async (info, tab) => {
-  if (!tab?.id) return;
-  if (info.menuItemId !== MENU_ID && info.menuItemId !== AI_MENU_ID) return;
+  if (!tab?.id || info.menuItemId !== MENU_ID) return;
 
   const word = normalizeWord(info.selectionText);
   if (!word) return;
 
   const context = await getSelectionContext(tab.id);
-  await lookupAndShow(tab.id, word, context, { aiOnly: info.menuItemId === AI_MENU_ID });
+  await lookupAndShow(tab.id, word, context);
 });
 
-// Bubble links re-look-up in place; the options page reports AI availability.
+// Bubble suggestion links re-look-up in place.
 api.runtime.onMessage.addListener((message, sender) => {
-  if (message?.type === "gloss:openOptions") {
-    api.runtime.openOptionsPage();
-    return;
-  }
-
-  if (message?.type === "gloss:aiAvailability" && typeof message.availability === "string") {
-    setAiAvailability(message.availability).then(() => refreshAiMenu(message.availability));
-    return;
-  }
-
   if (message?.type !== "gloss:lookup" || !sender.tab?.id || !message.word) return;
 
   const tabId = sender.tab.id;
@@ -145,11 +76,27 @@ api.runtime.onMessage.addListener((message, sender) => {
 // ---------------------------------------------------------------------------
 
 async function define(word, context) {
-  let payload = await baseDefine(word);
+  let payload = null;
 
-  if (payload.ok && context) {
+  // Names are looked up as entities before the dictionary: Datamuse happily
+  // defines "Albert Einstein" as "a clever person", which is never what a
+  // selection of a person or place is asking for.
+  if (shouldTreatAsEntity(word, context)) {
+    payload = await lookupEntity(word).catch(() => null);
+  }
+
+  if (!payload) payload = await baseDefine(word);
+
+  // Last resort before "not found": topic sources that only accept an exact
+  // title/name match (books, papers, artwork, chemicals, species, code tags).
+  if (!payload.ok) {
+    const topic = await lookupTopic(word).catch(() => null);
+    if (topic) payload = topic;
+  }
+
+  if (payload.ok && context?.text && !payload.entity && !payload.topic) {
     try {
-      payload = await applyContext(payload, word, context);
+      payload = await applyContext(payload, word, context.text);
     } catch {
       // Keep the base result if context handling fails.
     }
@@ -169,34 +116,9 @@ async function lookupAndShow(tabId, word, context, options = {}) {
     if (chosen) payload = { ok: true, word, ...chosen };
   }
 
-  if (!payload && !options.aiOnly) payload = await define(word, context);
+  if (!payload) payload = await define(word, context);
 
-  // On-device AI: an explicit request, or the final tier when the cascade missed.
-  if (options.aiOnly || (!payload.ok && (await aiEnabled()))) {
-    const ai = await aiDefine(tabId, word, context);
-    if (ai?.ok) {
-      payload = ai;
-    } else if (!payload || !payload.ok) {
-      payload = {
-        ok: false,
-        word,
-        note: `On-device AI didn't answer — ${ai?.error ?? "unknown reason"}.`,
-        searchUrl: `https://www.google.com/search?q=define+${encodeURIComponent(word)}`,
-      };
-    }
-  }
-
-  // One-time nudge: only when a lookup genuinely fails, the model could actually
-  // help, and we have never shown the hint before.
-  if (!payload.ok && !options.aiOnly) {
-    await maybeProbeAvailability(tabId);
-    if (await shouldShowAiHint()) {
-      payload.aiHint = true;
-      await markHintShown();
-    }
-  }
-
-  await showBubble(tabId, payload);
+  await showBubble(tabId, payload, context?.rect ?? null);
 
   if (payload.ok && !/\s/.test(word)) {
     resolvePronunciation(word)
@@ -205,150 +127,21 @@ async function lookupAndShow(tabId, word, context, options = {}) {
       })
       .catch(() => {});
   }
-
-  // Learn whether the on-device model is ready (uses the activeTab we already have).
-  maybeProbeAvailability(tabId).catch(() => {});
 }
 
-async function aiEnabled() {
-  try {
-    const stored = await api.storage.local.get(SETTINGS_KEY);
-    return Boolean(stored?.[SETTINGS_KEY]?.aiEnabled);
-  } catch {
-    return false;
-  }
-}
-
-// Best-effort probe so the AI menu item appears as soon as the model is ready.
-async function maybeProbeAvailability(tabId) {
-  if ((await getAiAvailability()) === "available") return;
-
-  const availability = await probeAvailability(tabId);
-  if (!availability || availability === (await getAiAvailability())) return;
-
-  await setAiAvailability(availability);
-  await refreshAiMenu(availability);
-}
-
-async function probeAvailability(tabId) {
-  for (const world of ["ISOLATED", "MAIN"]) {
-    try {
-      const [{ result }] = await api.scripting.executeScript({
-        target: { tabId },
-        world,
-        func: async () => {
-          const LM = globalThis.LanguageModel;
-          if (!LM || typeof LM.availability !== "function") return "unsupported";
-          try {
-            return await LM.availability();
-          } catch {
-            return "unsupported";
-          }
-        },
-      });
-      if (typeof result === "string" && result !== "unsupported") return result;
-    } catch {
-      // world unsupported, or page not scriptable
-    }
-  }
-  return "unsupported";
-}
-
-// On-device definition via the W3C Prompt API (Gemini Nano / Phi-4-mini).
-// Returns { ok, text } or { error } with a human-readable reason.
-async function aiDefine(tabId, word, context) {
-  const attempts = [];
-
-  for (const world of ["ISOLATED", "MAIN"]) {
-    const res = await runOnDevice(tabId, word, context, world);
-    if (res?.ok && res.text) {
-      return {
-        ok: true,
-        word,
-        source: "On-device AI",
-        sourceUrl: "",
-        definitions: [{ partOfSpeech: null, text: res.text, example: null }],
-        note: "Generated on-device by your browser's built-in model.",
-      };
-    }
-    attempts.push(`${world} → ${res?.reason ?? "no result"}`);
-  }
-
-  return { error: attempts.join("  |  ") };
-}
-
-async function runOnDevice(tabId, word, context, world) {
-  try {
-    const [{ result }] = await api.scripting.executeScript({
-      target: { tabId },
-      world,
-      func: onDeviceExplain,
-      args: [word, context],
-    });
-    return result ?? { ok: false, reason: "empty result" };
-  } catch (e) {
-    return { ok: false, reason: `injection failed (${e?.message ?? e})` };
-  }
-}
-
-// Self-contained (serialized + injected). Runs in the page, where the Prompt API lives.
-async function onDeviceExplain(word, context) {
-  const LM = globalThis.LanguageModel;
-  if (!LM || typeof LM.availability !== "function") {
-    return { ok: false, reason: "no LanguageModel in this context" };
-  }
-
-  let availability;
-  try {
-    availability = await LM.availability();
-  } catch (e) {
-    return { ok: false, reason: `availability() threw: ${e?.name}: ${e?.message}` };
-  }
-
-  if (availability === "unavailable") {
-    return { ok: false, reason: "model reports 'unavailable' on this device" };
-  }
-
-  try {
-    const session = await LM.create({
-      initialPrompts: [
-        {
-          role: "system",
-          content:
-            "You explain what a word or term means, using at most two short sentences. Be concrete, plain and specific.",
-        },
-      ],
-    });
-
-    const prompt = context
-      ? `Term: "${word}"\nContext: ${context}\n\nWhat does "${word}" mean here?`
-      : `What does "${word}" mean?`;
-
-    const answer = await session.prompt(prompt);
-    if (typeof session.destroy === "function") session.destroy();
-
-    const text = (answer ?? "").trim();
-    return text
-      ? { ok: true, text }
-      : { ok: false, reason: `empty answer (availability=${availability})` };
-  } catch (e) {
-    return {
-      ok: false,
-      reason: `create/prompt failed (availability=${availability}): ${e?.name}: ${e?.message}`,
-    };
-  }
-}
-
-// Best-effort pronunciation. dictionaryapi.dev is flaky, so Wiktionary — whose
-// audio is reliable — is the fallback.
+// Best-effort pronunciation. dictionaryapi.dev is flaky, so Wiktionary audio and
+// Datamuse's IPA metadata fill the gaps.
 async function resolvePronunciation(word) {
   const dict = await safe(() => lookupPronunciation(word));
   if (dict?.audio) return dict;
 
   const wikt = await safe(() => lookupWiktionaryAudio(word));
-  if (wikt?.audio) return { phonetic: dict?.phonetic ?? null, audio: wikt.audio };
+  if (wikt?.audio) {
+    const phonetic = dict?.phonetic ?? (await safe(() => lookupDatamusePronunciation(word)))?.phonetic ?? null;
+    return { phonetic, audio: wikt.audio };
+  }
 
-  return dict ?? null;
+  return dict ?? (await safe(() => lookupDatamusePronunciation(word))) ?? null;
 }
 
 async function safe(fn) {
@@ -378,6 +171,25 @@ async function lookupPronunciation(word) {
 
   const result = { phonetic, audio };
   await cacheSet(PRON_CACHE_PREFIX, word, result);
+  return result;
+}
+
+// Datamuse metadata carries IPA when asked for it (md=r&ipa=1).
+async function lookupDatamusePronunciation(word) {
+  const cacheKey = `dm:${word}`;
+  const cached = await cacheGet(PRON_CACHE_PREFIX, cacheKey);
+  if (cached) return cached;
+
+  const data = await fetchJson(
+    `https://api.datamuse.com/words?sp=${encodeURIComponent(word)}&md=r&ipa=1&max=1`,
+    1500,
+  );
+  const tags = Array.isArray(data) ? data[0]?.tags ?? [] : [];
+  const ipa = tags.find((tag) => tag.startsWith("ipa_pron:"))?.slice("ipa_pron:".length);
+  if (!ipa) return null;
+
+  const result = { phonetic: `/${ipa}/`, audio: null };
+  await cacheSet(PRON_CACHE_PREFIX, cacheKey, result);
   return result;
 }
 
@@ -416,7 +228,7 @@ async function baseDefine(word) {
   const cached = await cacheGet(BASE_CACHE_PREFIX, word);
   if (cached) return cached;
 
-  const sources = [lookupDatamuse, lookupDictionary, lookupWikipedia];
+  const sources = [lookupDatamuse, lookupWiktionaryRest, lookupDictionary, lookupWikipedia];
 
   // Case matters to these APIs: "NEWS" misses Wiktionary's "news" and lands on
   // a Wikipedia disambiguation page. Try the word as typed, then lowercased.
@@ -470,11 +282,86 @@ async function lookupDatamuse(word) {
 
   if (definitions.length === 0) return null;
 
+  // defHeadword appears for some inflected forms ("einsteins" -> "einstein"),
+  // but not reliably ("geese" -> "Geese"), so only keep a real base form.
+  const headword =
+    data[0]?.defHeadword &&
+    data[0].defHeadword.toLowerCase() !== (data[0].word ?? word).toLowerCase()
+      ? data[0].defHeadword
+      : null;
+
   return {
     source: "Wiktionary",
     sourceUrl: `https://en.wiktionary.org/wiki/${encodeURIComponent(data[0].word ?? word)}`,
+    headword,
     definitions,
   };
+}
+
+// Tier 2 — Wiktionary REST: structured definitions with HTML markup. Used when
+// Datamuse has no entry (multiword phrases, senses Datamuse omits). Unlike the
+// rejected raw wikitext extract, this endpoint returns parsed definitions.
+async function lookupWiktionaryRest(word) {
+  const data = await fetchJson(
+    `https://en.wiktionary.org/api/rest_v1/page/definition/${encodeURIComponent(word)}`,
+  );
+  const groups = Array.isArray(data?.en) ? data.en : [];
+  const definitions = [];
+
+  for (const group of groups) {
+    // The "en" payload also carries Translingual/symbol sections (e.g. "run");
+    // only English senses belong in an English definition card.
+    if (group?.language !== "English") continue;
+
+    for (const def of group?.definitions ?? []) {
+      const text = htmlToText(def?.definition);
+      if (!text) continue;
+      definitions.push({
+        partOfSpeech: (group.partOfSpeech ?? "").toLowerCase() || null,
+        text,
+        example: null,
+      });
+      if (definitions.length >= 4) break;
+    }
+
+    if (definitions.length >= 4) break;
+  }
+
+  if (definitions.length === 0) return null;
+
+  return {
+    source: "Wiktionary",
+    sourceUrl: `https://en.wiktionary.org/wiki/${encodeURIComponent(word)}`,
+    definitions,
+  };
+}
+
+const HTML_ENTITIES = {
+  amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ", ndash: "–", mdash: "—",
+};
+
+function htmlToText(html) {
+  const stripped = (html ?? "")
+    .replace(/<br\s*\/?>/gi, " ")
+    .replace(/<\/(?:p|li|div|span|i|b)>/gi, " ")
+    .replace(/<[^>]*>/g, "");
+
+  return decodeHtmlEntities(stripped).replace(/\s+/g, " ").trim();
+}
+
+function decodeHtmlEntities(text) {
+  return text
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => codePointText(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_, decimal) => codePointText(Number(decimal)))
+    .replace(/&([a-z]+);/gi, (match, name) => HTML_ENTITIES[name.toLowerCase()] ?? match);
+}
+
+function codePointText(code) {
+  try {
+    return Number.isFinite(code) ? String.fromCodePoint(code) : "";
+  } catch {
+    return "";
+  }
 }
 
 function posLabel(code) {
@@ -486,7 +373,7 @@ function posLabel(code) {
   return labels[(code ?? "").trim().toLowerCase()] ?? null;
 }
 
-// Tier 2 — dictionaryapi.dev: fallback dictionary with phonetics and audio.
+// Tier 3 — dictionaryapi.dev: fallback dictionary with phonetics and audio.
 async function lookupDictionary(word) {
   if (/\s/.test(word)) return null; // single words only
 
@@ -521,11 +408,17 @@ async function lookupDictionary(word) {
   };
 }
 
-// Tier 3 — Wikipedia: concepts, jargon and entities (e.g. CNAME -> CNAME record).
+// Tier 4 — Wikipedia: concepts, jargon and entities (e.g. CNAME -> CNAME record).
 async function lookupWikipedia(word) {
-  const data = await fetchJson(
-    `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(word)}`,
-  );
+  const data = await fetchJson(wikipediaSummaryUrl(word));
+  return wikiSummary(data, word);
+}
+
+function wikipediaSummaryUrl(word) {
+  return `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(word)}`;
+}
+
+function wikiSummary(data, word) {
   if (!data || !data.extract) return null;
   if (data.type === "disambiguation") return null; // too ambiguous to be useful
 
@@ -536,8 +429,572 @@ async function lookupWikipedia(word) {
       `https://en.wikipedia.org/wiki/${encodeURIComponent(data.title ?? word)}`,
     title: data.title ?? null,
     description: data.description ?? null,
+    wikibaseItem: data.wikibase_item ?? null,
+    // Wikimedia returns thumb.wikimedia.org URLs with tracking query strings.
+    image: (data.thumbnail?.source ?? data.originalimage?.source ?? "").split("?")[0] || null,
     definitions: [{ partOfSpeech: null, text: clampText(data.extract, 500), example: null }],
   };
+}
+
+// ---------------------------------------------------------------------------
+// Entity lookups (people, places, organisations, works)
+// ---------------------------------------------------------------------------
+
+// A selection is a name when it is capitalised and is not just the first word
+// of a sentence. Acronyms (CNAME, NASA) stay on the word cascade.
+function shouldTreatAsEntity(word, context) {
+  const tokens = word.split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return false;
+
+  // Multi-word names always count: "Albert Einstein", "Buckingham Palace".
+  if (tokens.length > 1) return tokens.some((token) => /^\p{Lu}/u.test(token));
+
+  if (word.length < 2 || word === word.toUpperCase()) return false;
+  if (!/^\p{Lu}/u.test(word)) return false;
+
+  // "Nice" / "Gates" opening a sentence are most likely ordinary words.
+  return !context?.atSentenceStart;
+}
+
+// Entity result, or null when Wikipedia/Wikidata don't recognise it as one.
+// Definitive misses are cached; timeouts and rate limits are not, so the next
+// lookup retries instead of serving "not an entity" for six hours.
+async function lookupEntity(word) {
+  const cached = await cacheGet(ENTITY_CACHE_PREFIX, word);
+  if (cached) return cached.ok ? cached : null;
+
+  let summary;
+  try {
+    summary = wikiSummary(await fetchJsonOrThrow(wikipediaSummaryUrl(word)), word);
+  } catch (error) {
+    if (error?.status === 404) await cacheEntityMiss(word);
+    return null;
+  }
+
+  if (!summary) {
+    await cacheEntityMiss(word);
+    return null;
+  }
+
+  let facts = null;
+  if (summary.wikibaseItem) {
+    try {
+      facts = await lookupEntityFacts(summary.wikibaseItem);
+    } catch {
+      return null; // Wikidata hiccup: answer from the cascade and retry later
+    }
+  }
+
+  // Only treat the selection as an entity when Wikidata can name its kind.
+  // Otherwise "April" or "Musk" would lose a perfectly good word definition.
+  if (!facts?.kind) {
+    await cacheEntityMiss(word);
+    return null;
+  }
+
+  const payload = {
+    ok: true,
+    entity: true,
+    word,
+    source: summary.source,
+    sourceUrl: summary.sourceUrl,
+    title: summary.title,
+    description: summary.description,
+    image: summary.image ?? null,
+    kind: facts.kind,
+    facts: facts.facts,
+    coords: facts.coords ?? null,
+    mapsUrl: facts.coords ? mapsUrl(facts.coords) : null,
+    definitions: summary.definitions,
+    note: facts.facts.length > 0 ? "Summary from Wikipedia, facts from Wikidata." : null,
+  };
+
+  await cacheSet(ENTITY_CACHE_PREFIX, word, payload);
+  return payload;
+}
+
+async function cacheEntityMiss(word) {
+  await cacheSet(ENTITY_CACHE_PREFIX, word, { ok: false }, MISS_CACHE_TTL_MS);
+}
+
+const KIND_RULES = [
+  ["Person", /^human$/i],
+  [
+    "Place",
+    /\b(city|town|village|commune|municipality|country|capital|region|province|district|county|state|prefecture|department|continent|island|mountain|river|lake|sea|ocean|desert|park|palace|castle|tower|building|monument|landmark|museum|stadium|bridge|airport|station|neighborhood|neighbourhood|settlement|locality|administrative territorial entity)\b/i,
+  ],
+  [
+    "Organisation",
+    /\b(company|business|organization|organisation|enterprise|university|college|school|institute|agency|political party|club|association|foundation|bank|airline|government)\b/i,
+  ],
+  [
+    "Work",
+    /\b(film|novel|book|song|album|video game|television series|painting|sculpture|opera|play|written work)\b/i,
+  ],
+];
+
+const FACT_PROPS = {
+  Person: [["P569", "Born"], ["P106", "Occupation"], ["P27", "Citizenship"]],
+  Place: [["P17", "Country"], ["P131", "Located in"], ["P1082", "Population"]],
+  Organisation: [["P571", "Founded"], ["P159", "Headquarters"], ["P452", "Industry"]],
+  Work: [["P50", "Author"], ["P571", "Published"], ["P495", "Country of origin"]],
+};
+
+const FACT_PROP_IDS = [
+  "P31", "P569", "P106", "P27", "P17", "P131", "P1082", "P571", "P159", "P452", "P50", "P495",
+];
+
+const WIKIDATA_UNITS = {
+  Q712226: "km²",
+  Q35852: "ha",
+  Q25343: "m²",
+};
+
+async function lookupEntityFacts(qid) {
+  const data = await fetchJsonOrThrow(
+    "https://www.wikidata.org/w/api.php?action=wbgetentities&format=json&origin=*" +
+      `&props=claims&languages=en&ids=${encodeURIComponent(qid)}`,
+  );
+  const claims = data?.entities?.[qid]?.claims;
+  if (!claims) return null;
+
+  // One label request covers P31 and every value we may print.
+  const ids = new Set();
+  for (const prop of FACT_PROP_IDS) {
+    for (const statement of claims[prop] ?? []) {
+      const id = statement.mainsnak?.datavalue?.value?.id;
+      if (id) ids.add(id);
+    }
+  }
+  const labels = await fetchItemLabels([...ids]);
+
+  const kind = classifyKind(claims.P31 ?? [], labels);
+  if (!kind) return null;
+
+  return { kind, facts: collectFacts(kind, claims, labels), coords: extractCoordinates(claims.P625 ?? []) };
+}
+
+function extractCoordinates(statements) {
+  const value = bestStatements(statements)[0]?.mainsnak?.datavalue?.value;
+  if (typeof value?.latitude !== "number" || typeof value?.longitude !== "number") return null;
+  return { latitude: value.latitude, longitude: value.longitude };
+}
+
+function mapsUrl({ latitude, longitude }) {
+  const lat = latitude.toFixed(5);
+  const lon = longitude.toFixed(5);
+  return `https://www.openstreetmap.org/?mlat=${lat}&mlon=${lon}#map=13/${lat}/${lon}`;
+}
+
+async function fetchItemLabels(ids) {
+  const labels = new Map();
+  for (let index = 0; index < ids.length; index += 50) {
+    const batch = ids.slice(index, index + 50);
+    const data = await fetchJsonOrThrow(
+      "https://www.wikidata.org/w/api.php?action=wbgetentities&format=json&origin=*" +
+        `&props=labels&languages=en&ids=${batch.map(encodeURIComponent).join("|")}`,
+    );
+    for (const [id, entity] of Object.entries(data?.entities ?? {})) {
+      const label = entity?.labels?.en?.value;
+      if (label) labels.set(id, label);
+    }
+  }
+  return labels;
+}
+
+function classifyKind(statements, labels) {
+  const types = bestStatements(statements)
+    .map((statement) => labels.get(statement.mainsnak?.datavalue?.value?.id) ?? "")
+    .filter(Boolean);
+
+  for (const [kind, pattern] of KIND_RULES) {
+    if (types.some((type) => pattern.test(type))) return kind;
+  }
+  return null;
+}
+
+function bestStatements(statements) {
+  const usable = statements.filter(
+    (statement) => statement.rank !== "deprecated" && statement.mainsnak?.datavalue,
+  );
+  const preferred = usable.filter((statement) => statement.rank === "preferred");
+  return preferred.length > 0 ? preferred : usable;
+}
+
+function collectFacts(kind, claims, labels) {
+  const rows = [];
+
+  for (const [prop, label] of FACT_PROPS[kind] ?? []) {
+    let statements = bestStatements(claims[prop] ?? []);
+    if (prop === "P1082") statements = latestPopulation(statements);
+
+    const values = [];
+    for (const statement of statements) {
+      const formatted = formatClaimValue(prop, statement, labels);
+      if (!formatted || values.includes(formatted)) continue;
+      values.push(formatted);
+      if (values.length >= 3) break;
+    }
+
+    if (values.length > 0) rows.push({ label, value: values.join(", ") });
+    if (rows.length >= 3) break;
+  }
+
+  return rows;
+}
+
+// Population is published per year; show the most recent value.
+function latestPopulation(statements) {
+  if (statements.length <= 1) return statements;
+
+  const timed = statements.map((statement) => ({
+    statement,
+    time: statement.qualifiers?.P585?.[0]?.datavalue?.value?.time ?? "",
+  }));
+
+  return [timed.sort((a, b) => b.time.localeCompare(a.time))[0].statement];
+}
+
+function formatClaimValue(prop, statement, labels) {
+  const value = statement.mainsnak?.datavalue?.value;
+  if (!value) return null;
+
+  if (prop === "P1082" && value.amount) return formatQuantity(value);
+  if (value.id) return labels.get(value.id) ?? null;
+  if (value.time) return formatWikidataTime(value);
+  if (value.amount) return formatQuantity(value);
+  if (typeof value === "string") return value;
+
+  return null;
+}
+
+function formatWikidataTime(value) {
+  const match = /^([+-])(\d{4,})-(\d{2})-(\d{2})/.exec(value.time ?? "");
+  if (!match) return null;
+
+  const year = Number(match[2]);
+  const month = Number(match[3]);
+  const day = Number(match[4]);
+  const suffix = match[1] === "-" ? " BC" : "";
+  const precision = value.precision ?? 9;
+
+  // Wikidata's JSON time is ISO 8601:1988-style: -0458 is 458 BC, not 459 BC.
+  if (precision >= 11 && month > 0 && day > 0) {
+    const date = new Date(Date.UTC(year, month - 1, day));
+    return `${date.toLocaleDateString("en-GB", {
+      day: "numeric", month: "long", year: "numeric", timeZone: "UTC",
+    })}${suffix}`;
+  }
+
+  if (precision === 10 && month > 0) {
+    const date = new Date(Date.UTC(year, month - 1, 1));
+    return `${date.toLocaleDateString("en-GB", {
+      month: "long", year: "numeric", timeZone: "UTC",
+    })}${suffix}`;
+  }
+
+  return `${year}${suffix}`;
+}
+
+function formatQuantity(value) {
+  const amount = Number(value.amount);
+  if (!Number.isFinite(amount)) return null;
+
+  const unitId = (value.unit ?? "").split("/").pop();
+  const unit = WIKIDATA_UNITS[unitId] ?? "";
+  const number = amount.toLocaleString("en-US", { maximumFractionDigits: 1 });
+
+  return unit ? `${number} ${unit}` : number;
+}
+
+// ---------------------------------------------------------------------------
+// Topic lookups (books, papers, artwork, chemicals, species, code tags)
+// ---------------------------------------------------------------------------
+
+// Only consulted when the word cascade misses. Every source must return an
+// exact title/name match; fuzzy search results are discarded.
+const TOPIC_SOURCES = [
+  lookupStackTag,
+  lookupOpenLibraryBook,
+  lookupCrossrefPaper,
+  lookupArtInstituteArtwork,
+  lookupPubChemCompound,
+  lookupGbifSpecies,
+];
+
+async function lookupTopic(word) {
+  const cached = await cacheGet(TOPIC_CACHE_PREFIX, word);
+  if (cached) return cached.ok ? cached : null;
+
+  const settled = await Promise.allSettled(TOPIC_SOURCES.map((source) => source(word)));
+  const candidates = settled
+    .filter((entry) => entry.status === "fulfilled" && entry.value)
+    .map((entry) => entry.value);
+
+  if (candidates.length === 0) {
+    // Cache a definitive "no match"; retry when a source failed transiently.
+    const failed = settled.some((entry) => entry.status === "rejected");
+    if (!failed) await cacheSet(TOPIC_CACHE_PREFIX, word, { ok: false }, MISS_CACHE_TTL_MS);
+    return null;
+  }
+
+  // Prefer the most specific kind of match: species/chemical > artwork > book/paper
+  // > code tag. A 39-question tag must not beat a novel called "Dune".
+  const best = candidates.sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0))[0];
+  const { priority, ...result } = best;
+  const payload = { ok: true, word, topic: true, ...result };
+  await cacheSet(TOPIC_CACHE_PREFIX, word, payload);
+  return payload;
+}
+
+async function topicJson(url) {
+  try {
+    return await fetchJsonOrThrow(url, TOPIC_TIMEOUT_MS);
+  } catch (error) {
+    if (error?.status === 404) return null;
+    throw error;
+  }
+}
+
+function normalizeTitle(value) {
+  return stripTags(String(value ?? ""))
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim();
+}
+
+function topicPayload({
+  source,
+  sourceUrl,
+  title,
+  description,
+  kind,
+  image,
+  facts,
+  definitions,
+  priority = 0,
+}) {
+  return {
+    source,
+    sourceUrl,
+    title: title ?? null,
+    description: description || null,
+    kind,
+    image: image ?? null,
+    facts: (facts ?? []).filter((fact) => fact?.value),
+    definitions: [{ partOfSpeech: null, text: definitions, example: null }],
+    priority,
+  };
+}
+
+async function lookupStackTag(word) {
+  const tag = encodeURIComponent(word);
+  const info = await topicJson(
+    `https://api.stackexchange.com/2.3/tags/${tag}/info?site=stackoverflow`,
+  );
+  const item = (info?.items ?? []).find(
+    (entry) => normalizeTitle(entry.name) === normalizeTitle(word),
+  );
+  if (!item) return null;
+
+  const count = Number(item.count) || 0;
+  if (count < 50) return null; // too obscure to be a useful answer for prose
+  const questions = count.toLocaleString("en-US");
+
+  let excerpt = "";
+  try {
+    const wiki = await topicJson(
+      `https://api.stackexchange.com/2.3/tags/${tag}/wikis?site=stackoverflow`,
+    );
+    excerpt = htmlToText(wiki?.items?.[0]?.excerpt ?? "");
+  } catch {
+    // Keep the tag even when its wiki excerpt can't be loaded.
+  }
+
+  return topicPayload({
+    source: "Stack Overflow",
+    sourceUrl: `https://stackoverflow.com/questions/tagged/${tag}`,
+    title: item.name,
+    description: `${questions} questions on Stack Overflow`,
+    kind: "Code",
+    definitions: excerpt || `Programming tag with ${questions} questions.`,
+    priority: count >= 500 ? 2 : 1,
+  });
+}
+
+async function lookupOpenLibraryBook(word) {
+  const fields = "key,title,author_name,first_publish_year,subject,cover_i,first_sentence";
+  const data = await topicJson(
+    `https://openlibrary.org/search.json?title=${encodeURIComponent(word)}` +
+      `&limit=5&fields=${fields}`,
+  );
+  const doc = (data?.docs ?? []).find(
+    (entry) => entry.key && normalizeTitle(entry.title) === normalizeTitle(word),
+  );
+  if (!doc) return null;
+
+  const authors = (doc.author_name ?? []).slice(0, 3);
+  const subjects = (doc.subject ?? []).slice(0, 3);
+  const year = doc.first_publish_year;
+  const sentence = clampText((doc.first_sentence?.[0] ?? "").replace(/\s+/g, " ").trim(), 300);
+
+  return topicPayload({
+    source: "Open Library",
+    sourceUrl: `https://openlibrary.org${doc.key}`,
+    title: doc.title,
+    description: [authors.join(", "), year].filter(Boolean).join(" · "),
+    kind: "Book",
+    image: doc.cover_i ? `https://covers.openlibrary.org/b/id/${doc.cover_i}-M.jpg` : null,
+    facts: [
+      { label: "Author", value: authors.join(", ") },
+      { label: "First published", value: year ? String(year) : null },
+      { label: "Subjects", value: subjects.join(", ") },
+    ],
+    definitions:
+      sentence ||
+      `Book${authors.length ? ` by ${authors.join(", ")}` : ""}` +
+        `${year ? `, first published in ${year}` : ""}.`,
+    priority: 2,
+  });
+}
+
+async function lookupCrossrefPaper(word) {
+  const select = "DOI,title,author,issued,container-title,abstract,is-referenced-by-count";
+  const data = await topicJson(
+    `https://api.crossref.org/works?rows=5&select=${select}` +
+      `&query.bibliographic=${encodeURIComponent(word)}`,
+  );
+  const item = (data?.message?.items ?? []).find(
+    (entry) => entry.DOI && normalizeTitle(entry.title?.[0]) === normalizeTitle(word),
+  );
+  if (!item) return null;
+
+  const authors = (item.author ?? [])
+    .slice(0, 3)
+    .map((author) => [author.given, author.family].filter(Boolean).join(" "))
+    .filter(Boolean);
+  const year = item.issued?.["date-parts"]?.[0]?.[0];
+  const venue = item["container-title"]?.[0] ?? null;
+  const citations = Number(item["is-referenced-by-count"]);
+  const abstract = htmlToText(item.abstract ?? "");
+
+  return topicPayload({
+    source: "Crossref",
+    sourceUrl: `https://doi.org/${item.DOI}`,
+    title: item.title[0],
+    description: [venue, year].filter(Boolean).join(" · "),
+    kind: "Paper",
+    facts: [
+      { label: "Authors", value: authors.join(", ") },
+      { label: "Published", value: year ? String(year) : null },
+      { label: "Cited by", value: Number.isFinite(citations) ? citations.toLocaleString("en-US") : null },
+    ],
+    definitions:
+      clampText(abstract, 400) ||
+      `Paper${venue ? ` in ${venue}` : ""}${year ? ` (${year})` : ""}.`,
+    priority: 2,
+  });
+}
+
+async function lookupArtInstituteArtwork(word) {
+  const fields =
+    "id,title,artist_title,date_display,medium_display,image_id,place_of_origin,short_description";
+  const data = await topicJson(
+    `https://api.artic.edu/api/v1/artworks/search?q=${encodeURIComponent(word)}` +
+      `&fields=${fields}&limit=5`,
+  );
+  const item = (data?.data ?? []).find(
+    (entry) => entry.id && normalizeTitle(entry.title) === normalizeTitle(word),
+  );
+  if (!item) return null;
+
+  return topicPayload({
+    source: "Art Institute of Chicago",
+    sourceUrl: `https://www.artic.edu/artworks/${item.id}`,
+    title: item.title,
+    description: [item.artist_title, item.date_display].filter(Boolean).join(" · "),
+    kind: "Artwork",
+    image: item.image_id
+      ? `https://www.artic.edu/iiif/2/${item.image_id}/full/400,/0/default.jpg`
+      : null,
+    facts: [
+      { label: "Artist", value: item.artist_title },
+      { label: "Date", value: item.date_display },
+      { label: "Medium", value: item.medium_display },
+    ],
+    definitions:
+      clampText(htmlToText(item.short_description ?? ""), 400) ||
+      "Artwork in the Art Institute of Chicago collection.",
+    priority: 3,
+  });
+}
+
+async function lookupPubChemCompound(word) {
+  const data = await topicJson(
+    "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/" +
+      `${encodeURIComponent(word)}/property/MolecularFormula,MolecularWeight,IUPACName/JSON`,
+  );
+  const compound = data?.PropertyTable?.Properties?.[0];
+  if (!compound?.CID) return null;
+
+  const formula = compound.MolecularFormula ?? null;
+  const weight = compound.MolecularWeight ? `${compound.MolecularWeight} g/mol` : null;
+  const iupac = compound.IUPACName ?? null;
+
+  return topicPayload({
+    source: "PubChem",
+    sourceUrl: `https://pubchem.ncbi.nlm.nih.gov/compound/${compound.CID}`,
+    title: word,
+    description: iupac,
+    kind: "Chemical",
+    facts: [
+      { label: "Formula", value: formula },
+      { label: "Molecular weight", value: weight },
+      { label: "IUPAC name", value: iupac },
+    ],
+    definitions:
+      `Chemical compound${formula ? ` with the formula ${formula}` : ""}` +
+      `${weight ? ` and a molecular weight of ${weight}` : ""}.`,
+    priority: 4,
+  });
+}
+
+async function lookupGbifSpecies(word) {
+  const data = await topicJson(
+    `https://api.gbif.org/v1/species/match?name=${encodeURIComponent(word)}`,
+  );
+  const rank = data?.rank ?? "";
+
+  if (data?.matchType !== "EXACT" || !["SPECIES", "SUBSPECIES", "GENUS"].includes(rank)) {
+    return null;
+  }
+
+  const name = data.canonicalName ?? data.scientificName;
+  if (!name) return null;
+
+  return topicPayload({
+    source: "GBIF",
+    sourceUrl: `https://www.gbif.org/species/${data.usageKey}`,
+    title: name,
+    description: [rankLabel(rank), data.family ? `family ${data.family}` : data.kingdom]
+      .filter(Boolean)
+      .join(" · "),
+    kind: "Species",
+    facts: [
+      { label: "Rank", value: rankLabel(rank) },
+      { label: "Kingdom", value: data.kingdom },
+      { label: "Family", value: data.family },
+    ],
+    definitions: `Scientific name: ${data.scientificName ?? name}.`,
+    priority: 4,
+  });
+}
+
+function rankLabel(rank) {
+  const text = String(rank ?? "").toLowerCase();
+  return text ? text.charAt(0).toUpperCase() + text.slice(1) : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -551,6 +1008,12 @@ async function applyContext(base, word, context) {
   const queryTokens = new Set(tokenize(word));
   if (queryTokens.size === 0) return base;
 
+  const contextSet = new Set(contextTokens);
+
+  // Even when no different Wikipedia sense wins, prefer the dictionary sense
+  // that best matches the sentence the word was selected in.
+  base = rankDefinitionsByContext(base, queryTokens, contextSet);
+
   // Only consider articles that are plausibly a *sense of this word* — the title
   // must share a word with the query. This stops us from "disambiguating" to an
   // article that merely happens to be mentioned on the page (e.g. searching
@@ -561,7 +1024,6 @@ async function applyContext(base, word, context) {
 
   if (candidates.length === 0) return base;
 
-  const contextSet = new Set(contextTokens);
   const scored = candidates
     .map((hit) => ({ hit, score: scoreHit(hit, queryTokens, contextSet) }))
     .sort((a, b) => b.score - a.score);
@@ -585,8 +1047,7 @@ async function applyContext(base, word, context) {
 }
 
 // A candidate counts as a sense of the query only if their titles share a word.
-function isSenseOf(hit, queryTokens) {
-  const titleTokens = new Set(tokenize(hit.title));
+function isSenseOf(hit, queryTokens) {  const titleTokens = new Set(tokenize(hit.title));
   for (const token of queryTokens) {
     if (titleTokens.has(token)) return true;
   }
@@ -603,6 +1064,39 @@ function scoreHit(hit, queryTokens, contextSet) {
     if (titleTokens.has(token)) score += 3;
     else if (bodyTokens.has(token)) score += 1;
   }
+  return score;
+}
+
+// Put the sense whose wording overlaps the selection's sentence first. This is
+// how a polysemous word gets a useful default before Wikipedia is consulted.
+function rankDefinitionsByContext(payload, queryTokens, contextSet) {
+  const definitions = payload.definitions ?? [];
+  if (definitions.length < 2) return payload;
+
+  const scored = definitions.map((definition, index) => ({
+    definition,
+    index,
+    score:
+      textOverlap(definition.text, queryTokens, contextSet) * 2 +
+      textOverlap(definition.example, queryTokens, contextSet),
+  }));
+
+  const best = scored.reduce((max, entry) => Math.max(max, entry.score), 0);
+  if (best < DEFINITION_MIN_SCORE) return payload;
+
+  scored.sort((a, b) => b.score - a.score || a.index - b.index);
+  return { ...payload, definitions: scored.map((entry) => entry.definition) };
+}
+
+function textOverlap(text, queryTokens, contextSet) {
+  const tokens = new Set(tokenize(text));
+  let score = 0;
+
+  for (const token of contextSet) {
+    if (queryTokens.has(token)) continue;
+    if (tokens.has(token)) score += 1;
+  }
+
   return score;
 }
 
@@ -683,11 +1177,29 @@ async function getSelectionContext(tabId) {
       target: { tabId },
       func: () => {
         const selection = window.getSelection();
-        if (!selection || selection.rangeCount === 0) return "";
+        if (!selection || selection.rangeCount === 0) {
+          return { text: "", atSentenceStart: false, rect: null };
+        }
 
+        const range = selection.getRangeAt(0);
         const selectedText = selection.toString().replace(/\s+/g, " ").trim();
 
-        let node = selection.getRangeAt(0).startContainer;
+        // Capture the anchor now: entity lookups can take a few seconds, and the
+        // caret may have moved by the time the bubble renders.
+        const rangeRect = range.getBoundingClientRect();
+        const rect =
+          rangeRect && (rangeRect.width || rangeRect.height)
+            ? {
+                left: rangeRect.left,
+                top: rangeRect.top,
+                right: rangeRect.right,
+                bottom: rangeRect.bottom,
+                width: rangeRect.width,
+                height: rangeRect.height,
+              }
+            : null;
+
+        let node = range.startContainer;
         while (node && node.nodeType !== 1) node = node.parentNode;
 
         const element = node instanceof Element ? node : node?.parentElement ?? null;
@@ -697,7 +1209,23 @@ async function getSelectionContext(tabId) {
           ) ?? element;
 
         const full = (block?.innerText ?? "").replace(/\s+/g, " ").trim();
-        if (!full) return "";
+        if (!full) return { text: "", atSentenceStart: false, rect };
+
+        // Exact text before the selection, so a repeated word can't be mistaken
+        // for the sentence's first word.
+        let beforeSelection = "";
+        try {
+          if (block) {
+            const preceding = document.createRange();
+            preceding.selectNodeContents(block);
+            preceding.setEnd(range.startContainer, range.startOffset);
+            beforeSelection = preceding.toString().replace(/\s+/g, " ").trimEnd();
+          }
+        } catch {
+          // Ranges across shadow boundaries; fall back to no position signal.
+        }
+        const atSentenceStart =
+          !beforeSelection || /[.!?;:]["'”’)\]]*$/.test(beforeSelection);
 
         // Use only the sentence around the selection (never the page title), so
         // the page's main topic can't dominate the sense scoring.
@@ -715,16 +1243,22 @@ async function getSelectionContext(tabId) {
             const after = full.slice(at + selectedText.length);
             const endRel = after.search(/[.!?;]/);
             const end = endRel >= 0 ? at + selectedText.length + endRel + 1 : full.length;
-            return full.slice(start, end).trim().slice(0, 400);
+            return { text: full.slice(start, end).trim().slice(0, 400), atSentenceStart, rect };
           }
         }
 
-        return full.slice(0, 400);
+        return { text: full.slice(0, 400), atSentenceStart, rect };
       },
     });
-    return result ?? "";
+
+    return {
+      text: typeof result?.text === "string" ? result.text : "",
+      atSentenceStart: result?.atSentenceStart === true,
+      rect: typeof result?.rect?.top === "number" ? result.rect : null,
+    };
   } catch {
-    return ""; // Restricted pages (chrome://, PDF viewer) have no context.
+    // Restricted pages (chrome://, PDF viewer) have no context or anchor.
+    return { text: "", atSentenceStart: false, rect: null };
   }
 }
 
@@ -746,9 +1280,31 @@ async function fetchJson(url, timeoutMs = REQUEST_TIMEOUT_MS) {
   }
 }
 
+// Same request, but failures throw so callers can tell "no such page" (404)
+// from "try again later" (timeout, 429, network error).
+async function fetchJsonOrThrow(url, timeoutMs = REQUEST_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    if (!res.ok) {
+      const error = new Error(`HTTP ${res.status}`);
+      error.status = res.status;
+      throw error;
+    }
+    return await res.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Cache (hits and misses), keyed by prefix + lowercased key
 // ---------------------------------------------------------------------------
+
+const CACHE_BYTE_BUDGET = 8 * 1024 * 1024; // prune before Chrome's 10 MB local quota
+const PRUNE_EVERY_WRITES = 25;
+let cacheWrites = 0;
 
 async function cacheGet(prefix, key) {
   try {
@@ -767,21 +1323,55 @@ async function cacheSet(prefix, key, payload, ttl = CACHE_TTL_MS) {
   try {
     const storageKey = prefix + key.toLowerCase();
     await api.storage.local.set({ [storageKey]: { ts: Date.now(), ttl, payload } });
+    cacheWrites += 1;
+    if (cacheWrites % PRUNE_EVERY_WRITES === 0) {
+      pruneCache().catch(() => {});
+    }
   } catch {
     // Caching is best-effort.
   }
+}
+
+// Drop expired entries, then the oldest ones when storage approaches its quota.
+// chrome.storage.local is ~10 MB; without this the cache grows forever.
+async function pruneCache() {
+  if (typeof api.storage.local.getBytesInUse !== "function") return;
+  if ((await api.storage.local.getBytesInUse(null)) < CACHE_BYTE_BUDGET) return;
+
+  const all = await api.storage.local.get(null);
+  const entries = Object.entries(all ?? {}).filter(
+    ([key, value]) => key.startsWith("gloss:") && typeof value?.ts === "number",
+  );
+  if (entries.length === 0) return;
+
+  const now = Date.now();
+  const expired = entries
+    .filter(([, value]) => now - value.ts > (value.ttl ?? CACHE_TTL_MS))
+    .map(([key]) => key);
+
+  if (expired.length > 0) {
+    await api.storage.local.remove(expired);
+    return; // re-check on the next prune; don't over-delete in one pass
+  }
+
+  entries.sort((a, b) => a[1].ts - b[1].ts);
+  const oldest = entries
+    .slice(0, Math.max(1, Math.ceil(entries.length * 0.3)))
+    .map(([key]) => key);
+
+  await api.storage.local.remove(oldest);
 }
 
 // ---------------------------------------------------------------------------
 // Bubble (injected into the page)
 // ---------------------------------------------------------------------------
 
-async function showBubble(tabId, payload) {
+async function showBubble(tabId, payload, selectionRect = null) {
   try {
     await api.scripting.executeScript({
       target: { tabId },
       func: renderGlossBubble,
-      args: [payload],
+      args: [payload, selectionRect],
     });
   } catch {
     // Pages like chrome:// or the PDF viewer can't be scripted.
@@ -877,7 +1467,7 @@ function attachPronunciation(word, pron) {
 
 // Self-contained: it is serialized and injected, so it must not reference
 // anything from this file's scope. Everything arrives via `payload`.
-function renderGlossBubble(payload) {
+function renderGlossBubble(payload, selectionRect) {
   const HOST_ID = "__gloss_bubble_host__";
   const prior = document.getElementById(HOST_ID);
   if (prior) prior.remove();
@@ -913,6 +1503,12 @@ function renderGlossBubble(payload) {
     }
     .head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
     .word { font-size: 18px; font-weight: 650; }
+    .kind {
+      font-size: 10.5px; font-weight: 700; letter-spacing: 0.04em;
+      text-transform: uppercase; color: #2563eb;
+      background: rgba(37, 99, 235, 0.12);
+      border-radius: 999px; padding: 2px 7px;
+    }
     .phon { color: #6b7280; font-size: 13px; }
     .play {
       display: inline-flex; align-items: center; justify-content: center;
@@ -922,11 +1518,24 @@ function renderGlossBubble(payload) {
     .play:hover { color: #1d4ed8; background: rgba(37, 99, 235, 0.12); }
     .play svg { display: block; }
     .desc { color: #4b5563; font-size: 13px; margin: 4px 0 0; }
+    .thumb {
+      float: right; width: 76px; height: 76px; object-fit: cover;
+      border-radius: 8px; margin: 2px 0 8px 12px;
+      background: rgba(0, 0, 0, 0.06);
+    }
+    .headword { color: #6b7280; font-size: 12.5px; margin: 4px 0 0; }
     ul { margin: 8px 0 0; padding: 0; list-style: none; }
     li { margin: 0 0 8px; }
     li:last-child { margin-bottom: 0; }
     .pos { font-style: italic; color: #6b7280; margin-right: 4px; }
     .eg { color: #6b7280; font-size: 13px; margin-top: 2px; }
+    .facts {
+      margin: 10px 0 0; display: grid;
+      grid-template-columns: max-content 1fr; gap: 3px 10px;
+      font-size: 13px;
+    }
+    .facts dt { color: #6b7280; }
+    .facts dd { margin: 0; }
     .empty { color: #374151; margin: 6px 0 0; }
     .note { color: #6b7280; font-size: 12px; font-style: italic; margin: 8px 0 0; }
     .foot {
@@ -936,6 +1545,7 @@ function renderGlossBubble(payload) {
     }
     .foot a, .empty a { color: #2563eb; text-decoration: none; font-size: 12px; }
     .foot a:hover, .empty a:hover { text-decoration: underline; }
+    .foot-links { display: inline-flex; gap: 10px; align-items: center; }
     .close {
       position: absolute; top: 6px; right: 8px;
       border: 0; background: transparent; cursor: pointer;
@@ -950,28 +1560,10 @@ function renderGlossBubble(payload) {
     .alts a { color: #2563eb; text-decoration: none; }
     .alts a:hover { text-decoration: underline; }
     .alts-label { color: #6b7280; }
-    .hint {
-      position: relative;
-      margin-top: 10px;
-      padding: 8px 26px 8px 10px;
-      background: rgba(37, 99, 235, 0.08);
-      border-radius: 8px;
-      font-size: 12px;
-      color: #374151;
-    }
-    .hint a { color: #2563eb; text-decoration: none; }
-    .hint a:hover { text-decoration: underline; }
-    .hint-close {
-      position: absolute; top: 3px; right: 5px;
-      border: 0; background: transparent; cursor: pointer;
-      color: #9ca3af; font-size: 15px; line-height: 1; padding: 2px 4px;
-    }
-    .hint-close:hover { color: #111827; }
     @media (prefers-color-scheme: dark) {
       .card { background: #1f1f23; color: #e8e8ea; border-color: rgba(255, 255, 255, 0.14); }
-      .phon, .desc, .pos, .eg, .badge, .note, .alts, .alts-label { color: #a1a1aa; }
-      .hint { background: rgba(96, 165, 250, 0.14); color: #d4d4d8; }
-      .hint-close:hover { color: #ffffff; }
+      .phon, .desc, .pos, .eg, .badge, .note, .alts, .alts-label, .facts dt { color: #a1a1aa; }
+      .kind { color: #93c5fd; background: rgba(96, 165, 250, 0.16); }
       .empty { color: #d4d4d8; }
       .foot { border-top-color: rgba(255, 255, 255, 0.12); }
       .close:hover { color: #ffffff; }
@@ -1000,10 +1592,28 @@ function renderGlossBubble(payload) {
   const head = document.createElement("div");
   head.className = "head";
 
+  // Entity card image from the Wikipedia summary (thumb.wikimedia.org).
+  if (payload.image) {
+    const thumb = document.createElement("img");
+    thumb.className = "thumb";
+    thumb.src = payload.image;
+    thumb.alt = "";
+    thumb.loading = "lazy";
+    thumb.referrerPolicy = "no-referrer";
+    card.appendChild(thumb);
+  }
+
   const word = document.createElement("span");
   word.className = "word";
   word.textContent = displayWord(payload.word);
   head.appendChild(word);
+
+  if (payload.kind) {
+    const kind = document.createElement("span");
+    kind.className = "kind";
+    kind.textContent = payload.kind;
+    head.appendChild(kind);
+  }
 
   if (payload.phonetic) {
     const phon = document.createElement("span");
@@ -1026,6 +1636,13 @@ function renderGlossBubble(payload) {
     desc.className = "desc";
     desc.textContent = payload.description;
     card.appendChild(desc);
+  }
+
+  if (payload.headword) {
+    const headword = document.createElement("p");
+    headword.className = "headword";
+    headword.textContent = `Inflected form of ${payload.headword}`;
+    card.appendChild(headword);
   }
 
   if (payload.ok) {
@@ -1066,6 +1683,21 @@ function renderGlossBubble(payload) {
     card.appendChild(empty);
   }
 
+  if (Array.isArray(payload.facts) && payload.facts.length > 0) {
+    const facts = document.createElement("dl");
+    facts.className = "facts";
+
+    for (const fact of payload.facts) {
+      const term = document.createElement("dt");
+      term.textContent = fact.label;
+      const value = document.createElement("dd");
+      value.textContent = fact.value;
+      facts.append(term, value);
+    }
+
+    card.appendChild(facts);
+  }
+
   if (payload.note) {
     const note = document.createElement("p");
     note.className = "note";
@@ -1103,40 +1735,6 @@ function renderGlossBubble(payload) {
     card.appendChild(alts);
   }
 
-  if (payload.aiHint) {
-    const hint = document.createElement("div");
-    hint.className = "hint";
-
-    const text = document.createElement("span");
-    text.textContent =
-      "On-device AI can explain words like this — free, private, no account. ";
-    hint.appendChild(text);
-
-    const enable = document.createElement("a");
-    enable.href = "#";
-    enable.textContent = "Enable in settings";
-    enable.addEventListener("click", (event) => {
-      event.preventDefault();
-      const rt = globalThis.browser ?? globalThis.chrome;
-      try {
-        rt.runtime.sendMessage({ type: "gloss:openOptions" });
-      } catch {
-        // ignore
-      }
-    });
-    hint.appendChild(enable);
-
-    const dismiss = document.createElement("button");
-    dismiss.className = "hint-close";
-    dismiss.type = "button";
-    dismiss.setAttribute("aria-label", "Dismiss");
-    dismiss.textContent = "\u00d7";
-    dismiss.addEventListener("click", () => hint.remove());
-    hint.appendChild(dismiss);
-
-    card.appendChild(hint);
-  }
-
   if (payload.source) {
     const foot = document.createElement("div");
     foot.className = "foot";
@@ -1145,14 +1743,28 @@ function renderGlossBubble(payload) {
     badge.textContent = `Source: ${payload.source}`;
     foot.appendChild(badge);
 
+    const links = document.createElement("span");
+    links.className = "foot-links";
+
+    if (payload.mapsUrl) {
+      const map = document.createElement("a");
+      map.href = payload.mapsUrl;
+      map.target = "_blank";
+      map.rel = "noopener noreferrer";
+      map.textContent = "Map \u2197";
+      links.appendChild(map);
+    }
+
     if (payload.sourceUrl) {
       const link = document.createElement("a");
       link.href = payload.sourceUrl;
       link.target = "_blank";
       link.rel = "noopener noreferrer";
       link.textContent = "Open \u2197";
-      foot.appendChild(link);
+      links.appendChild(link);
     }
+
+    if (links.childElementCount > 0) foot.appendChild(links);
 
     card.appendChild(foot);
   }
@@ -1161,15 +1773,26 @@ function renderGlossBubble(payload) {
 
   // --- positioning near the selection ---
   const RECT_MARGIN = 8;
+  const anchor =
+    selectionRect && (selectionRect.width || selectionRect.height) ? selectionRect : null;
+
   let left = RECT_MARGIN;
   let top = 80;
+  let anchorTop = top;
 
-  const selection = window.getSelection();
-  if (selection && selection.rangeCount > 0) {
-    const rect = selection.getRangeAt(0).getBoundingClientRect();
-    if (rect && (rect.width || rect.height)) {
-      left = rect.left;
-      top = rect.bottom + RECT_MARGIN;
+  if (anchor) {
+    left = anchor.left;
+    top = anchor.bottom + RECT_MARGIN;
+    anchorTop = anchor.top;
+  } else {
+    const selection = window.getSelection();
+    if (selection && selection.rangeCount > 0) {
+      const rect = selection.getRangeAt(0).getBoundingClientRect();
+      if (rect && (rect.width || rect.height)) {
+        left = rect.left;
+        top = rect.bottom + RECT_MARGIN;
+        anchorTop = rect.top;
+      }
     }
   }
 
@@ -1180,8 +1803,7 @@ function renderGlossBubble(payload) {
   left = Math.max(RECT_MARGIN, Math.min(left, maxLeft));
 
   if (top + cardRect.height > window.innerHeight - RECT_MARGIN) {
-    const above = cardRect.top - cardRect.height - RECT_MARGIN;
-    top = Math.max(RECT_MARGIN, above);
+    top = Math.max(RECT_MARGIN, anchorTop - cardRect.height - RECT_MARGIN);
   }
 
   host.style.left = `${Math.round(left)}px`;
@@ -1213,8 +1835,10 @@ function renderGlossBubble(payload) {
 
 function normalizeWord(raw) {
   const trimmed = (raw ?? "").replace(/\s+/g, " ").trim();
+  // "Einstein's" must look up Einstein, not the plural "Einsteins".
+  const depossessive = trimmed.replace(/['\u2019]s$/i, "");
   // Strip surrounding punctuation, keep the meaningful characters.
-  const cleaned = trimmed.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "");
+  const cleaned = depossessive.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "");
   return cleaned.slice(0, 64);
 }
 
