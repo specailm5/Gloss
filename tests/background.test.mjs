@@ -9,9 +9,21 @@ function jsonResponse(body, status = 200) {
   return { ok: status >= 200 && status < 300, status, json: async () => body };
 }
 
+function hasTopicCache(store, word) {
+  return [...store.keys()].some((key) => key.startsWith(`gloss:v5:topic:${word}|`));
+}
+
 function harness() {
   const store = new Map();
   let bytes = 0;
+  let grantedOrigins = [
+    "https://api.stackexchange.com/*",
+    "https://openlibrary.org/*",
+    "https://api.crossref.org/*",
+    "https://api.artic.edu/*",
+    "https://pubchem.ncbi.nlm.nih.gov/*",
+    "https://api.gbif.org/*",
+  ];
   let fetchImpl = async (url) => {
     throw new Error(`unexpected fetch: ${url}`);
   };
@@ -29,6 +41,21 @@ function harness() {
       remove: async () => {},
       create() {},
       onClicked: event(),
+    },
+    permissions: {
+      async getAll() {
+        return { origins: [...grantedOrigins] };
+      },
+      async contains({ origins }) {
+        return origins.every((origin) => grantedOrigins.includes(origin));
+      },
+      async request({ origins }) {
+        grantedOrigins = [...new Set([...grantedOrigins, ...origins])];
+        return true;
+      },
+      async remove({ origins }) {
+        grantedOrigins = grantedOrigins.filter((origin) => !origins.includes(origin));
+      },
     },
     storage: {
       local: {
@@ -77,6 +104,9 @@ function harness() {
     },
     setFetch(fn) {
       fetchImpl = fn;
+    },
+    setOrigins(origins) {
+      grantedOrigins = origins;
     },
   };
 }
@@ -306,7 +336,7 @@ test("pruneCache removes the oldest 30% when storage is near quota", async () =>
   const { context, store, setBytes } = harness();
   const now = Date.now();
   for (let index = 0; index < 10; index += 1) {
-    store.set(`gloss:v4:base:word${index}`, {
+    store.set(`gloss:v5:base:word${index}`, {
       ts: now - 10_000 + index,
       ttl: 10 ** 9,
       payload: {},
@@ -317,22 +347,22 @@ test("pruneCache removes the oldest 30% when storage is near quota", async () =>
   setBytes(9 * 1024 * 1024);
   await context.pruneCache();
 
-  assert.equal(store.has("gloss:v4:base:word0"), false);
-  assert.equal(store.has("gloss:v4:base:word2"), false);
-  assert.equal(store.has("gloss:v4:base:word3"), true);
+  assert.equal(store.has("gloss:v5:base:word0"), false);
+  assert.equal(store.has("gloss:v5:base:word2"), false);
+  assert.equal(store.has("gloss:v5:base:word3"), true);
   assert.equal(store.has("unrelated:key"), true);
 });
 
 test("pruneCache drops expired entries before touching fresh ones", async () => {
   const { context, store, setBytes } = harness();
-  store.set("gloss:v4:base:old", { ts: 1, ttl: 1, payload: {} });
-  store.set("gloss:v4:base:fresh", { ts: Date.now(), ttl: 10 ** 9, payload: {} });
+  store.set("gloss:v5:base:old", { ts: 1, ttl: 1, payload: {} });
+  store.set("gloss:v5:base:fresh", { ts: Date.now(), ttl: 10 ** 9, payload: {} });
 
   setBytes(9 * 1024 * 1024);
   await context.pruneCache();
 
-  assert.equal(store.has("gloss:v4:base:old"), false);
-  assert.equal(store.has("gloss:v4:base:fresh"), true);
+  assert.equal(store.has("gloss:v5:base:old"), false);
+  assert.equal(store.has("gloss:v5:base:fresh"), true);
 });
 
 test("normalizeTitle ignores accents, punctuation and case", () => {
@@ -521,7 +551,7 @@ test("lookupTopic prefers the most specific match and caches the result", async 
   const first = await context.lookupTopic("Dune");
   assert.equal(first.kind, "Book");
   assert.equal(requests, 6);
-  assert.ok(store.has("gloss:v4:topic:dune"));
+  assert.ok(hasTopicCache(store, "dune"));
 
   setFetch(async () => {
     throw new Error("should be cached");
@@ -575,7 +605,7 @@ test("lookupTopic does not cache a miss when a source fails transiently", async 
 
   setFetch(async (url) => miss(url));
   assert.equal(await context.lookupTopic("Zxqv Plorb"), null);
-  assert.equal(store.has("gloss:v4:topic:zxqv plorb"), false);
+  assert.equal(hasTopicCache(store, "zxqv plorb"), false);
 
   setFetch(async (url) => {
     if (url.includes("pubchem")) {
@@ -584,5 +614,138 @@ test("lookupTopic does not cache a miss when a source fails transiently", async 
     return miss(url);
   });
   assert.equal(await context.lookupTopic("Zxqv Plorb"), null);
-  assert.ok(store.has("gloss:v4:topic:zxqv plorb"));
+  assert.ok(hasTopicCache(store, "zxqv plorb"));
+});
+
+test("topic lookups are skipped when no extra source is enabled", async () => {
+  const { context, setFetch, setOrigins, store } = harness();
+  setOrigins([]);
+  setFetch(async () => {
+    throw new Error("should not fetch");
+  });
+
+  assert.equal(await context.lookupTopic("Dune"), null);
+  assert.equal(hasTopicCache(store, "dune"), false);
+});
+
+test("topic lookups query only the enabled sources", async () => {
+  const { context, setFetch, setOrigins } = harness();
+  setOrigins(["https://openlibrary.org/*"]);
+  let requests = 0;
+
+  setFetch(async (url) => {
+    requests += 1;
+    if (!url.includes("openlibrary.org")) throw new Error(`unexpected ${url}`);
+    return jsonResponse({
+      docs: [{ key: "/works/OL2W", title: "Dune", author_name: ["Frank Herbert"] }],
+    });
+  });
+
+  const payload = await context.lookupTopic("Dune");
+  assert.equal(payload.kind, "Book");
+  assert.equal(requests, 1);
+});
+
+test("categoryForDescription gives coarse labels for Other meanings", () => {
+  const { context } = harness();
+  assert.equal(context.categoryForDescription("City and county in England"), "place");
+  assert.equal(context.categoryForDescription("Association football club in England"), "football club");
+  assert.equal(context.categoryForDescription("American public speaker (born 1990)"), "person");
+  assert.equal(context.categoryForDescription("Research university in England"), "organisation");
+  assert.equal(context.categoryForDescription(""), null);
+  assert.equal(
+    context.categoryForDescription("British medium bomber in World War II"),
+    "British medium bomber in World War II",
+  );
+});
+
+test("wikipediaSearch attaches descriptions used for category labels", async () => {
+  const { context, setFetch } = harness();
+
+  setFetch(async (url) => {
+    if (url.includes("list=search")) {
+      return jsonResponse({
+        query: {
+          search: [
+            { title: "Bristol", snippet: "city in England" },
+            { title: "Bristol City F.C.", snippet: "football club" },
+          ],
+        },
+      });
+    }
+    if (url.includes("prop=description")) {
+      return jsonResponse({
+        query: {
+          pages: {
+            1: { title: "Bristol", description: "City and county in England" },
+            2: { title: "Bristol City F.C.", description: "Association football club in England" },
+          },
+        },
+      });
+    }
+    throw new Error(`unexpected ${url}`);
+  });
+
+  const hits = await context.wikipediaSearch("Bristol");
+  assert.equal(hits[0].description, "City and county in England");
+  assert.equal(context.categoryForDescription(hits[0].description), "place");
+  assert.equal(context.categoryForDescription(hits[1].description), "football club");
+});
+
+test("alternatives carry their category labels", async () => {
+  const { context, setFetch } = harness();
+
+  setFetch(async (url) => {
+    if (url.includes("list=search")) {
+      return jsonResponse({
+        query: {
+          search: [
+            { title: "Bristol", snippet: "city in England" },
+            { title: "Bristol City F.C.", snippet: "football club" },
+          ],
+        },
+      });
+    }
+    if (url.includes("prop=description")) {
+      return jsonResponse({
+        query: {
+          pages: {
+            1: { title: "Bristol", description: "City and county in England" },
+            2: { title: "Bristol City F.C.", description: "Association football club in England" },
+          },
+        },
+      });
+    }
+    throw new Error(`unexpected ${url}`);
+  });
+
+  const alternatives = await context.findAlternatives("Bristol", null);
+  const city = alternatives.find((alt) => alt.title === "Bristol");
+  const club = alternatives.find((alt) => alt.title === "Bristol City F.C.");
+
+  assert.equal(city.category, "place");
+  assert.equal(club.category, "football club");
+});
+
+test("enabling a new source does not reuse an old topic miss", async () => {
+  const { context, setFetch, setOrigins, store } = harness();
+  setOrigins(["https://openlibrary.org/*"]);
+  setFetch(async () => jsonResponse({ docs: [] }));
+
+  assert.equal(await context.lookupTopic("Panthera Leo"), null);
+  assert.ok(hasTopicCache(store, "panthera leo"));
+
+  setOrigins(["https://openlibrary.org/*", "https://api.gbif.org/*"]);
+  let gbifCalls = 0;
+  setFetch(async (url) => {
+    if (url.includes("openlibrary.org")) return jsonResponse({ docs: [] });
+    if (url.includes("api.gbif.org")) {
+      gbifCalls += 1;
+      return jsonResponse({ matchType: "NONE" });
+    }
+    throw new Error(`unexpected ${url}`);
+  });
+
+  assert.equal(await context.lookupTopic("Panthera Leo"), null);
+  assert.equal(gbifCalls, 1);
 });

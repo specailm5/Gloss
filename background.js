@@ -10,7 +10,7 @@ const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 const MISS_CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours — outages shouldn't stick
 
 // Bump CACHE_VERSION to invalidate previously cached results after a fix.
-const CACHE_VERSION = "v4";
+const CACHE_VERSION = "v5";
 const BASE_CACHE_PREFIX = `gloss:${CACHE_VERSION}:base:`;
 const SEARCH_CACHE_PREFIX = `gloss:${CACHE_VERSION}:search:`;
 const PRON_CACHE_PREFIX = `gloss:${CACHE_VERSION}:pron:`;
@@ -714,19 +714,36 @@ function formatQuantity(value) {
 // Only consulted when the word cascade misses. Every source must return an
 // exact title/name match; fuzzy search results are discarded.
 const TOPIC_SOURCES = [
-  lookupStackTag,
-  lookupOpenLibraryBook,
-  lookupCrossrefPaper,
-  lookupArtInstituteArtwork,
-  lookupPubChemCompound,
-  lookupGbifSpecies,
+  { origin: "https://api.stackexchange.com/*", lookup: lookupStackTag },
+  { origin: "https://openlibrary.org/*", lookup: lookupOpenLibraryBook },
+  { origin: "https://api.crossref.org/*", lookup: lookupCrossrefPaper },
+  { origin: "https://api.artic.edu/*", lookup: lookupArtInstituteArtwork },
+  { origin: "https://pubchem.ncbi.nlm.nih.gov/*", lookup: lookupPubChemCompound },
+  { origin: "https://api.gbif.org/*", lookup: lookupGbifSpecies },
 ];
 
+// Extra sources are optional: only query hosts the user has enabled in settings.
+async function enabledTopicSources() {
+  try {
+    const granted = await api.permissions.getAll();
+    const origins = new Set(granted?.origins ?? []);
+    return TOPIC_SOURCES.filter((source) => origins.has(source.origin));
+  } catch {
+    return [];
+  }
+}
+
 async function lookupTopic(word) {
-  const cached = await cacheGet(TOPIC_CACHE_PREFIX, word);
+  const sources = await enabledTopicSources();
+  if (sources.length === 0) return null;
+
+  // Key by the enabled set too: enabling a new source must not reuse a miss that
+  // was cached when that source was off.
+  const cacheKey = topicCacheKey(word, sources);
+  const cached = await cacheGet(TOPIC_CACHE_PREFIX, cacheKey);
   if (cached) return cached.ok ? cached : null;
 
-  const settled = await Promise.allSettled(TOPIC_SOURCES.map((source) => source(word)));
+  const settled = await Promise.allSettled(sources.map((source) => source.lookup(word)));
   const candidates = settled
     .filter((entry) => entry.status === "fulfilled" && entry.value)
     .map((entry) => entry.value);
@@ -734,7 +751,7 @@ async function lookupTopic(word) {
   if (candidates.length === 0) {
     // Cache a definitive "no match"; retry when a source failed transiently.
     const failed = settled.some((entry) => entry.status === "rejected");
-    if (!failed) await cacheSet(TOPIC_CACHE_PREFIX, word, { ok: false }, MISS_CACHE_TTL_MS);
+    if (!failed) await cacheSet(TOPIC_CACHE_PREFIX, cacheKey, { ok: false }, MISS_CACHE_TTL_MS);
     return null;
   }
 
@@ -743,8 +760,13 @@ async function lookupTopic(word) {
   const best = candidates.sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0))[0];
   const { priority, ...result } = best;
   const payload = { ok: true, word, topic: true, ...result };
-  await cacheSet(TOPIC_CACHE_PREFIX, word, payload);
+  await cacheSet(TOPIC_CACHE_PREFIX, cacheKey, payload);
   return payload;
+}
+
+function topicCacheKey(word, sources) {
+  const origins = sources.map((source) => source.origin).sort().join("|");
+  return `${word}|${origins}`;
 }
 
 async function topicJson(url) {
@@ -1047,7 +1069,8 @@ async function applyContext(base, word, context) {
 }
 
 // A candidate counts as a sense of the query only if their titles share a word.
-function isSenseOf(hit, queryTokens) {  const titleTokens = new Set(tokenize(hit.title));
+function isSenseOf(hit, queryTokens) {
+  const titleTokens = new Set(tokenize(hit.title));
   for (const token of queryTokens) {
     if (titleTokens.has(token)) return true;
   }
@@ -1114,7 +1137,11 @@ function buildAlternatives(scored, chosenTitle, base) {
     const key = hit.title.toLowerCase();
     if (seen.has(key) || isDisambiguation(hit)) continue;
     seen.add(key);
-    out.push({ title: hit.title, url: wikiUrl(hit.title) });
+    out.push({
+      title: hit.title,
+      url: wikiUrl(hit.title),
+      category: categoryForDescription(hit.description),
+    });
     if (out.length >= 4) break;
   }
 
@@ -1130,14 +1157,43 @@ async function findAlternatives(word, excludeTitle) {
     const key = hit.title.toLowerCase();
     if (seen.has(key) || isDisambiguation(hit)) continue;
     seen.add(key);
-    out.push({ title: hit.title, url: wikiUrl(hit.title) });
+    out.push({
+      title: hit.title,
+      url: wikiUrl(hit.title),
+      category: categoryForDescription(hit.description),
+    });
     if (out.length >= 4) break;
   }
 
   return out;
 }
 
-// Cached Wikipedia search (candidates + short snippets for scoring).
+// Coarse labels for "Other meanings", from Wikipedia's short description.
+// Bristol -> place, Bristol City F.C. -> football club.
+const CATEGORY_RULES = [
+  ["football club", /football club|football team|soccer club/],
+  ["airport", /airport/],
+  ["railway station", /railway station|metro station|train station/],
+  ["place", /\b(city|town|village|capital|country|region|county|district|suburb|neighbourhood|neighborhood|island|river|mountain|lake|commune|municipality|place|settlement)\b/],
+  ["person", /\b(born|physicist|politician|actor|actress|singer|musician|writer|author|footballer|artist|scientist|philosopher|businessman|businesswoman|entrepreneur|royalty|noble)\b/],
+  ["organisation", /\b(company|organization|organisation|business|enterprise|airline|bank|university|college|school|charity|foundation|club)\b/],
+  ["album", /\balbum\b/],
+  ["song", /\bsong\b/],
+  ["film", /\bfilm\b|\bmovie\b/],
+  ["book", /\bnovel\b|\bbook\b/],
+  ["building", /\b(building|museum|stadium|palace|castle|tower|bridge|church|cathedral)\b/],
+];
+
+function categoryForDescription(description) {
+  const text = (description ?? "").toLowerCase();
+  for (const [label, pattern] of CATEGORY_RULES) {
+    if (pattern.test(text)) return label;
+  }
+  return description ? clampText(description, 40) : null;
+}
+
+// Cached Wikipedia search (candidates + short snippets for scoring) with short
+// descriptions, used to label each suggested meaning.
 async function wikipediaSearch(word) {
   const cached = await cacheGet(SEARCH_CACHE_PREFIX, word);
   if (cached) return cached;
@@ -1150,10 +1206,35 @@ async function wikipediaSearch(word) {
   const hits = (data?.query?.search ?? []).map((hit) => ({
     title: hit.title,
     snippet: hit.snippet ?? "",
+    description: null,
   }));
+
+  if (hits.length > 0) {
+    const descriptions = await fetchWikipediaDescriptions(hits.map((hit) => hit.title));
+    for (const hit of hits) {
+      hit.description = descriptions.get(hit.title.toLowerCase()) ?? null;
+    }
+  }
 
   await cacheSet(SEARCH_CACHE_PREFIX, word, hits);
   return hits;
+}
+
+async function fetchWikipediaDescriptions(titles) {
+  if (titles.length === 0) return new Map();
+
+  const data = await fetchJson(
+    "https://en.wikipedia.org/w/api.php?action=query&format=json&origin=*" +
+      `&prop=description&redirects=1&titles=${titles.map(encodeURIComponent).join("|")}`,
+  );
+
+  const descriptions = new Map();
+  for (const page of Object.values(data?.query?.pages ?? {})) {
+    if (page?.title && page.description) {
+      descriptions.set(page.title.toLowerCase(), page.description);
+    }
+  }
+  return descriptions;
 }
 
 function isDisambiguation(hit) {
@@ -1719,7 +1800,7 @@ function renderGlossBubble(payload, selectionRect) {
 
       const link = document.createElement("a");
       link.href = alt.url;
-      link.textContent = alt.title;
+      link.textContent = alt.category ? `${alt.title} (${alt.category})` : alt.title;
       link.addEventListener("click", (event) => {
         event.preventDefault();
         const rt = globalThis.browser ?? globalThis.chrome;

@@ -12,6 +12,8 @@ heuristics, caching, timeouts, permissions and test commands belong in this file
 in the README or the popup. UI errors state what happened and what to do next — never
 a raw exception, HTTP status or internal reason.
 
+Firefox needs **128+** for `optional_host_permissions`; Chrome/Edge need 102+.
+
 ## Core behavior
 
 - Context menu item: `What is "%s"?` (contexts: `selection`).
@@ -57,15 +59,19 @@ a raw exception, HTTP status or internal reason.
   When P625 coordinates exist, add a **Map** link to OpenStreetMap (no extra call).
 - If **every tier misses**, the popup shows a short "no definition found" message
   plus a **"Search the web"** link — never a dead end.
-- **Topic sources are the last resort before "not found".** After the word cascade
-  misses, try exact-title/name matches from Stack Overflow tags, Open Library books,
-  Crossref papers, Art Institute of Chicago artwork, PubChem chemicals and GBIF
-  species. Fuzzy search results are discarded — the normalised title/name must equal
-  the selection.
+- **Topic sources are the last resort before "not found"** and are **opt-in**.
+  After the word cascade misses, query only the enabled sources: Stack Overflow tags,
+  Open Library books, Crossref papers, Art Institute of Chicago artwork, PubChem
+  chemicals and GBIF species. Fuzzy search results are discarded — the normalised
+  title/name must equal the selection.
 - Topic results show a kind badge (**Book**, **Paper**, **Artwork**, **Chemical**,
   **Species**, **Code**) and link to the source record. Priority is specificity:
   species/chemical > artwork > book/paper > code tag (a tag needs ≥50 questions;
   ≥500 ranks it with books). Context sense selection does not run on a topic card.
+- **Other meanings carry a coarse category** from Wikipedia's short description, e.g.
+  `Bristol (place)`, `Bristol City F.C. (football club)`, `Bristol Palin (person)`.
+  Fetch descriptions in one batched `prop=description` request and cache them with
+  the search results.
 - **No AI, no models, no downloads.** Gloss must not ship an on-device AI tier,
   request model storage or add an AI settings page; the extension is fully useful
   with the free, keyless cascade. This is a deliberate product decision, not a
@@ -74,7 +80,13 @@ a raw exception, HTTP status or internal reason.
 
 ## Technical rules
 
-- Manifest V3. Permissions: `contextMenus` + `activeTab` (host permissions as needed).
+- Manifest V3. Core permissions: `contextMenus`, `activeTab`, `scripting`,
+  `storage`. Core hosts: Datamuse, dictionaryapi.dev, Wiktionary, Wikipedia,
+  Wikidata, Wikimedia uploads.
+- **Extra sources are optional host permissions**, requested from the settings page
+  on a user gesture and removable at any time. Gate every topic lookup with
+  `permissions.getAll()`; when no extra source is enabled, skip the tier entirely
+  (no request, no cached miss).
 - **All network fetches run in the background service worker**, never the content script.
 - Treat **any** non-200 response or thrown error as a *miss* and fall through to the next tier.
 - Give each source a short timeout (~3s) via `AbortController` so a hanging API can't stall the popup.
@@ -92,9 +104,11 @@ a raw exception, HTTP status or internal reason.
 - **Prune the cache**: `chrome.storage.local` is ~10 MB. Drop expired entries, then
   the oldest ~30% when usage exceeds the internal budget. Never prune non-cache keys.
 - Topic lookups run **in parallel** with a 2.5s per-source timeout, and only when the
-  word cascade misses. Cache hits for 7 days; cache a miss only when every source
-  answered definitively (a timeout, `429` or network error means retry later).
-- Topic host permissions: `openlibrary.org`, `api.crossref.org`,
+  word cascade misses. Cache hits for 7 days; cache a miss only when every enabled
+  source answered definitively (a timeout, `429` or network error means retry later).
+  Key the topic cache by the **enabled source set** so turning a new source on isn't
+  blocked by an old miss.
+- Topic host permissions are **optional**: `openlibrary.org`, `api.crossref.org`,
   `pubchem.ncbi.nlm.nih.gov`, `api.gbif.org`, `api.artic.edu`,
   `api.stackexchange.com`. Images are page-rendered from `covers.openlibrary.org`
   and `www.artic.edu` and need no host permission.

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Gloss",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Right-click any word to instantly see what it means — everyday words, people and places, acronyms and technical jargon.",
   "permissions": ["contextMenus", "activeTab", "scripting", "storage"],
   "host_permissions": [
@@ -10,7 +10,9 @@
     "https://en.wiktionary.org/*",
     "https://upload.wikimedia.org/*",
     "https://en.wikipedia.org/*",
-    "https://www.wikidata.org/*",
+    "https://www.wikidata.org/*"
+  ],
+  "optional_host_permissions": [
     "https://openlibrary.org/*",
     "https://api.crossref.org/*",
     "https://pubchem.ncbi.nlm.nih.gov/*",
@@ -22,6 +24,10 @@
     "scripts": ["background.js"],
     "service_worker": "background.js"
   },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": false
+  },
   "icons": {
     "16": "icons/icon-16.png",
     "32": "icons/icon-32.png",
@@ -31,7 +37,7 @@
   "browser_specific_settings": {
     "gecko": {
       "id": "gloss@example.local",
-      "strict_min_version": "121.0"
+      "strict_min_version": "128.0"
     }
   }
 }

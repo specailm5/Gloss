@@ -9,8 +9,8 @@ leaving the page.
 - **People and places** — a short summary, a photo, and facts such as date of birth,
   country, population, or headquarters.
 - **Acronyms and jargon** — technical terms that a normal dictionary doesn't cover.
-- **Books, papers, artworks, chemicals, species and code tags** — when a word has
-  no dictionary entry, Gloss tries these collections before giving up.
+- **Books, papers, artworks, chemicals, species and code tags** — optional extra
+  sources you can enable in settings.
 - **Pronunciation** — phonetic spelling, with audio when a recording exists.
 - **Other meanings** — when a word has several senses, related articles are one
   click away.
@@ -37,6 +37,19 @@ Clicking a suggested meaning looks that article up in place.
 1. Open `about:debugging#/runtime/this-firefox`.
 2. Choose **Load Temporary Add-on…** and select `manifest.json`.
 
+## Extra sources
+
+Gloss can also look up books, papers, artwork, chemicals, species and programming
+tags. These are off by default, because each one needs permission to contact its
+source.
+
+Open the extension's settings and turn on the ones you want:
+
+- **Chrome / Edge:** `chrome://extensions` → Gloss → **Details** → **Extension options**.
+- **Firefox:** `about:addons` → Gloss → **Preferences**.
+
+You can turn any of them off again at any time.
+
 ## Privacy
 
 - No account, no sign-up, no analytics.
@@ -50,8 +63,8 @@ Clicking a suggested meaning looks that article up in place.
 Definitions and facts come from [Wikipedia](https://www.wikipedia.org),
 [Wiktionary](https://www.wiktionary.org), [Wikidata](https://www.wikidata.org),
 [Datamuse](https://www.datamuse.com) and
-[dictionaryapi.dev](https://dictionaryapi.dev). Books come from
-[Open Library](https://openlibrary.org), papers from
+[dictionaryapi.dev](https://dictionaryapi.dev). When enabled in settings, extra
+sources add books from [Open Library](https://openlibrary.org), papers from
 [Crossref](https://www.crossref.org), artwork from the
 [Art Institute of Chicago](https://www.artic.edu), chemicals from
 [PubChem](https://pubchem.ncbi.nlm.nih.gov), species from
